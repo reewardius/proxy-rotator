@@ -31,6 +31,36 @@ class ProxyRotator:
         with self.ua_lock:
             return next(self.user_agent_cycle)
 
+    def handle_connect(self, client_socket, hostname, port):
+        try:
+            # Создаём соединение с целевым сервером
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.connect((hostname, port))
+            
+            # Отправляем клиенту подтверждение установки туннеля
+            client_socket.send(b'HTTP/1.1 200 Connection established\r\n\r\n')
+            
+            # Создаём два потока для пересылки данных в обоих направлениях
+            def forward(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.send(data)
+                except:
+                    pass
+                finally:
+                    src.close()
+                    dst.close()
+
+            threading.Thread(target=forward, args=(client_socket, server_socket)).start()
+            threading.Thread(target=forward, args=(server_socket, client_socket)).start()
+            
+        except Exception as e:
+            self.log(f"Error in CONNECT tunnel: {e}")
+            client_socket.close()
+
     def handle_client(self, client_socket, client_address):
         request_data = b''
         while True:
@@ -46,18 +76,28 @@ class ProxyRotator:
             parser = HttpParser()
             parser.execute(request_data, len(request_data))
             
-            # Получаем метод, хост и путь
             method = parser.get_method()
             headers = {}
             for header in parser.get_headers().items():
                 headers[header[0]] = header[1]
             host = headers.get('Host', '')
             path = parser.get_path()
-            
-            # Создаем новый запрос со следующим User-Agent из цикла
+
+            self.log(f"Request from {client_address[0]}:{client_address[1]}")
+            self.log(f"→ {method} {path}")
+
+            # Обработка CONNECT запроса
+            if method == 'CONNECT':
+                hostname, port = path.split(':')
+                self.log(f"→ Establishing CONNECT tunnel to {hostname}:{port}")
+                self.handle_connect(client_socket, hostname, int(port))
+                return
+
+            # Обычный HTTP/HTTPS запрос
             new_headers = headers.copy()
             new_user_agent = self.get_next_user_agent()
             new_headers['User-Agent'] = new_user_agent
+            self.log(f"→ Changed User-Agent to: {new_user_agent}")
             
             is_https = path.startswith('https://')
             if is_https:
@@ -68,11 +108,6 @@ class ProxyRotator:
                 port = 80
                 hostname = host
                 protocol = "HTTP"
-            
-            # Логируем информацию о запросе
-            self.log(f"Request from {client_address[0]}:{client_address[1]}")
-            self.log(f"→ {protocol} {method} {hostname}{path}")
-            self.log(f"→ Changed User-Agent to: {new_user_agent}")
             
             # Создаем соединение с целевым сервером
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
